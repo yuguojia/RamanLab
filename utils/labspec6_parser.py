@@ -36,6 +36,10 @@ ASCII tag rather than by pointer:
                + null byte, then the filename as UTF-16LE + double-null.
 
 Byte order: all multi-byte values little-endian.
+
+Counted, labelled LabSpec 6.6 arrays are preferred over the heuristics above,
+preserving small steps at stitched scan boundaries. Compressed containers
+are decoded by labspec6_compression before parsing their data blocks.
 """
 
 from __future__ import annotations
@@ -45,6 +49,8 @@ import warnings
 import numpy as np
 from typing import Tuple, Optional, Dict, Any, List
 from pathlib import Path
+
+from .labspec6_compression import decompress_labspec6
 
 
 # Constants
@@ -91,12 +97,15 @@ class LabSpec6Parser:
             
             if raw[:8] != _MAGIC:
                 return None, None, {'error': 'Not a LabSpec 6 file'}
+
+            raw, compression = decompress_labspec6(raw)
+            arrays = self._read_labelled_arrays(raw)
             
-            wavenumbers = self._read_axis(raw)
+            wavenumbers = arrays[0] if arrays is not None else self._read_axis(raw)
             if wavenumbers is None:
                 return None, None, {'error': 'Could not extract wavenumber axis'}
             
-            intensities = self._read_intensity(raw, len(wavenumbers))
+            intensities = arrays[1] if arrays is not None else self._read_intensity(raw, len(wavenumbers))
             if intensities is None:
                 return None, None, {'error': 'Could not extract intensity data'}
             
@@ -107,6 +116,7 @@ class LabSpec6Parser:
                 'filepath': str(file_path),
                 'file_size': file_path.stat().st_size,
                 'format': 'LabSpec6',
+                'compression': compression,
                 'sample_name': sample_name,
                 'data_points': len(wavenumbers),
                 'wavenumber_range': (float(wavenumbers[0]), float(wavenumbers[-1])),
@@ -118,6 +128,38 @@ class LabSpec6Parser:
             
         except Exception as e:
             return None, None, {'error': f'Error parsing file: {str(e)}'}
+
+    def _read_labelled_arrays(self, raw: bytes):
+        """Read counted LabSpec 6.6 arrays, including stitched spectral axes.
+
+        The first 'tam' may contain a sample name. Locate intensity by its
+        'Intens' label and the axis by its unit, rather than by tag order.
+        A tag's upper four bytes may contain a saved address fragment.
+        """
+        intensity_label = raw.find(b'Intens\x00')
+        unit = raw.find(b'1/cm\x00', max(0, intensity_label))
+        if intensity_label < 0 or unit < 0:
+            return None
+        marker = raw.find(_ETAM_MARKER, intensity_label, unit)
+        if marker < 12 or raw[marker - 8:marker - 4] != b'\x09\x10\x00\x00':
+            return None
+        count = struct.unpack_from('<I', raw, marker - 12)[0]
+        axis_marker = raw.find(_ETAM_MARKER, unit, unit + 256)
+        if count < _AXIS_MIN_POINTS or axis_marker < 0:
+            return None
+        arrays = []
+        for offset in (axis_marker + _ETAM_DATA_SKIP, marker + _ETAM_DATA_SKIP):
+            end = offset + count * 4
+            if end + 4 > len(raw) or raw[end:end + 4] != b'\x09\x10\x00\x00':
+                raise ValueError('Invalid counted LabSpec spectrum array boundary')
+            values = np.frombuffer(raw, dtype='<f4', count=count, offset=offset).copy()
+            if not np.all(np.isfinite(values)):
+                raise ValueError('Nonfinite values in LabSpec spectrum array')
+            arrays.append(values)
+        if not np.all(np.diff(arrays[0]) > 0):
+            raise ValueError('LabSpec wavenumber axis is not increasing')
+        self._finalize_intensity(arrays[1])
+        return tuple(arrays)
     
     def _read_axis(self, raw: bytes) -> Optional[np.ndarray]:
         """
@@ -366,6 +408,10 @@ class LabSpec6Parser:
             return ""
         
         pos = film_pos + 16
+        # Some files wrap the name in a separate 'tam' string node.
+        prefix = raw.find(b'Spectrum\x00', pos, pos + 96)
+        if prefix >= 0:
+            pos = prefix
         
         while pos < len(raw) and raw[pos] != 0:
             pos += 1
